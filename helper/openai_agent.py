@@ -1,49 +1,70 @@
 import os
 import openai
 from dotenv import load_dotenv
+from rapidfuzz import process
 
 load_dotenv()
 
 openai.api_key = os.getenv('OPENAI_API_KEY')
+'''use to check the models available'''
+# models = openai.Model.list()
+# for model in models['data']:
+#     print(model['id'])
+MODEL = 'gpt-4'
+SYSTEM_ROLE = "system"
+USER_ROLE = 'user'
+
+def convert_to_json(output_str):
+    output_list = output_str.split("\n")
+    json_output = {}
+
+    for output in output_list:
+        if not output.strip():
+            continue
+        fields = output.split(":")
+        if len(fields) < 2:  # Check if the delimiter is found
+            continue
+        key, value = fields[0].strip(), fields[1].strip()
+
+        # Remove all quotes from keys and values
+        key = key.replace('"', '')
+        value = value.replace('"', '')
+
+        # Remove comma at the end of the value
+        value = value.rstrip(',')
+
+        json_output[key] = value
+
+    return json_output
 
 
-def get_completion(prompt, model='gpt-3.5-turbo'):
-    messages = [{"role": "system", "content": "You are a helpful real state agent from DOSS that "
-                                              "you are getting information."},
-                {"role": 'user', 'content': prompt}]
-    response = openai.ChatCompletion.create(
-        model=model,
-        messages=messages,
-        temperature=0
-    )
-    return response.choices[0].message['content']
 
+def get_completion(prompt, model=MODEL):
+    messages = [{ "role": SYSTEM_ROLE, 
+                  "content": "you are gathing data from the user to query the database."},
+                { "role": USER_ROLE, 
+                  'content': prompt}]
+    try:
+        response = openai.ChatCompletion.create(
+            model=model,
+            messages=messages,
+            temperature=0,
+            max_tokens=100
+        )
+        return response.choices[0].message['content']
+    except Exception as e:
+        print(f"Error: {e}")
+        return None
 
 def create_prompt(x):
     prompt = f"""
-    Your task is to extract the following information from text delimited by triple backticks into a JSON format with the
-    following keys: Customer respond, City, State, zip code, minimum prince, maximum price, minimum bed, maximum bed,
-    minimum bath, maximum bath.
-
-    Please do not respond anything outside of the JSON format.
-
-    0 - customer respond: respond to the text as a helpful real state agent that you are getting information. If the text is not
-    related to real state, make an excuse and respond with something as a real state agent.
-    1 - City: the city that the customer is looking for a property. If it is not mentioned set it empty
-    2 - State: the state that the customer is looking for a property. If it is not mentioned try to find out from the name
-    of the city. If the city was not mentioned too, set it empty
-    3 - zip code: if zip code of the neighborhood was mentioned return it, otherwise if an area of the city was mentioned try
-     to guess the zip code for that neighborhood, otherwise set it empty.
-    4 - minimum price: if the minimum price was mention return it in integer, otherwise set it empty.
-    5 - maximum price: if the maximum price was mention return it in integer, otherwise set it empty.
-    6 - minimum bed: if the minimum number of bed was mention return it in integer, otherwise set it empty.
-    7 - maximum bed: if the maximum number of bed was mention return it in integer, otherwise set it empty.
-    8 - minimum bath: if the minimum number of bath was mention return it in integer, otherwise set it empty.
-    9 - maximum bath: if the maximum number of bath was mention return it in integer, otherwise set it empty.
-
-    '''{x}'''
+    Based on Zillow's seller guide, parse user's request for labels and values. 
+    Fill in city/state using zip if missing, and vice versa. Indicate ranges with '>' or '<'. Provide only the resulting dictionary.
+    
+    {x}
     """
     return prompt
+
 
 
 class UserChat:
@@ -51,38 +72,69 @@ class UserChat:
         self.username = user_name
 
     def get_prompt(self, message):
-        response = get_completion(create_prompt(message),
-                                  # model='gpt-4'
-                                  )
-        # print('get prompt response: ', response)
+        response = get_completion(create_prompt(message))
+        json_response = convert_to_json(response)
+
         try:
+            cleaned_response = self.clean_params(json_response)
             return {
                 'status': 1,
-                'response': eval(response)
+                'response': cleaned_response
             }
 
         except:
             return {
                 'status': 0,
                 'response': response
-            }
+        }
 
 
-def clean_params(initial_param):
-    param = initial_param.copy()
-    param['geo-city'] = param['City']
-    param['geo-state'] = param['State']
-    param['bathroom_count'] = param['minimum bath'] if not param['minimum bath'] == '' else param['maximum bath']
-    param['bedroom_count'] = param['minimum bed'] if not param['minimum bed'] == '' else param['maximum bed']
-
-    return param
 
 
-def clean_params_with_params(initial_param, webhook_params):
-    # for param in webhook_params
-    pass
+    def clean_params(self, initial_param):
+        param = initial_param.copy()
+        print(f"Initial parameters: {param}")
+        
+        # Clean and map parameters based on dialog_flow_key
+        dialog_flow_mapping = {
+            "bathroom_count": "bath",
+            "bedroom_count": "bed",
+            "geo-city": "city",
+            "floor_count": "floor_count",
+            "landmark": "landmark",
+            "geo-state": "state",
+            "max_price": "maximum price",
+            "min_price": "minimum price",
+            "transaction_type": "property type", 
+            "zip-code": "zip code",
+        }
 
+        new_param = {}
+        for key, value in param.items():
+            # use process.extractOne to find the best match
+            best_match = process.extractOne(key.lower(), dialog_flow_mapping.values(), score_cutoff=70)
+            
+            if best_match:  # If we have a match
+                # Find the key for the matched value in the dialog_flow_mapping
+                matched_key = [k for k, v in dialog_flow_mapping.items() if v == best_match[0]][0]
+                new_param[matched_key] = value
+
+        return new_param
+
+test_samples = [
+    "House in New York near empire state with more than 2 and less than 4 beds, more than 3 bath and less than 6",
+    "Apartment in San Francisco with 2 bedrooms and 2 bathrooms",
+    "Condo in Miami with 3 bedrooms and 2 bathrooms for less than $500,000",
+    "House in Los Angeles with 4 bedrooms and 3 bathrooms for more than $1,000,000",
+    "Townhouse in Chicago with 3 bedrooms and 2 bathrooms for less than $300,000",
+    "Apartment in Boston with 1 bedroom and 1 bathroom for less than $1,500 per month",
+    "Condo in Seattle with 2 bedrooms and 2 bathrooms for more than $700,000",
+    "House in Austin with 3 bedrooms and 2 bathrooms for less than $400,000",
+    "Townhouse in Denver with 2 bedrooms and 2 bathrooms for more than $300,000",
+    "Apartment in Portland with 1 bedroom and 1 bathroom for less than $1,000 per month"
+]
 
 if __name__ == "__main__":
-    temp_response = UserChat('temp').get_prompt("Apartments in New York near empire state with more than 2 and less"
-                                                " than 4 beds, more than 3 bath and less than 6 ")
+    for sample in test_samples:
+        response = UserChat('temp').get_prompt(sample)
+        print(response)
